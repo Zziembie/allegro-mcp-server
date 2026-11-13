@@ -6,8 +6,14 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+try:  # POSIX only; on other systems the token is refreshed without a lock.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 import httpx
 
@@ -37,7 +43,12 @@ def is_token_valid(token: dict[str, Any], now: float | None = None) -> bool:
 
 
 def write_token_file(path: Path, token: dict[str, Any]) -> None:
-    """Write the token as JSON, readable only by the current user (0600)."""
+    """Write the token as JSON, readable only by the current user (0600).
+
+    The write is atomic. If ``path`` is a symlink, the file it points to is
+    replaced and the link stays in place.
+    """
+    path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -118,6 +129,32 @@ class AllegroAuth:
             f"Delete it. {LOGIN_HINT}"
         )
 
+    @property
+    def lock_file(self) -> Path:
+        token_path = self.token_file.resolve()
+        return token_path.with_name(token_path.name + ".lock")
+
+    @contextmanager
+    def _refresh_lock(self) -> Iterator[None]:
+        """Exclusive lock around read-refresh-write.
+
+        Allegro refresh tokens are single use. Without the lock two processes
+        (for example the MCP server and a cron job) can both refresh with the
+        same token, and the one that loses the race is left with a revoked token.
+        """
+        if fcntl is None:
+            yield
+            return
+        lock_path = self.lock_file
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def save_token(self, token: dict[str, Any]) -> None:
         token = {**token, "saved_at": time.time()}
         write_token_file(self.token_file, token)
@@ -182,12 +219,17 @@ class AllegroAuth:
             )
         if is_token_valid(token):
             return token["access_token"]
-        refresh_token = token.get("refresh_token")
-        if not refresh_token:
-            raise AuthError(
-                f"The Allegro token has expired and has no refresh token. {LOGIN_HINT}"
-            )
-        return self.refresh(refresh_token)["access_token"]
+        with self._refresh_lock():
+            # Another process may have refreshed while we waited for the lock.
+            token = self.load_token() or {}
+            if is_token_valid(token):
+                return token["access_token"]
+            refresh_token = token.get("refresh_token")
+            if not refresh_token:
+                raise AuthError(
+                    f"The Allegro token has expired and has no refresh token. {LOGIN_HINT}"
+                )
+            return self.refresh(refresh_token)["access_token"]
 
     def device_code_flow(self) -> None:
         """Interactive device code login. Prints instructions to stderr and stores the token."""

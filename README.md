@@ -146,6 +146,11 @@ You can also put the variables directly in the `env` block instead of pointing t
   review every tool call, and consider testing against the sandbox first.
 - **The token stays on your machine.** It is stored as JSON with file mode `0600` in a
   directory with mode `0700`. Nothing is sent anywhere except the Allegro API.
+  `ALLEGRO_TOKEN_FILE` may be a symlink; the token is written atomically to the file it
+  points to and the link is kept.
+- **One refresh at a time.** Allegro refresh tokens are single use, so the server takes
+  an exclusive lock (`token.json.lock` next to the token, POSIX only) while it refreshes.
+  Several processes can share one token file without revoking each other's token.
 - **Order data contains personal data** (names, addresses, phone numbers, emails of
   buyers). Anything a tool returns is passed to the language model you use, so check
   that this is acceptable under your privacy obligations.

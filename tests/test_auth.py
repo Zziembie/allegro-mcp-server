@@ -172,3 +172,51 @@ def test_token_file_that_recovers_is_read(tmp_path, monkeypatch):
 
     monkeypatch.setattr("allegro_mcp.auth.time.sleep", finish_write)
     assert auth.get_access_token() == "ready"
+
+
+def test_save_through_symlink_keeps_the_link(tmp_path):
+    real = tmp_path / "secure" / "token.json"
+    real.parent.mkdir()
+    write_token_file(real, dict(access_token="a"))
+    auth = make_auth(tmp_path)
+    auth.token_file.parent.mkdir(parents=True)
+    os.symlink(real, auth.token_file)
+    auth.save_token(dict(access_token="b", expires_in=3600))
+    assert auth.token_file.is_symlink()
+    assert json.loads(real.read_text())["access_token"] == "b"
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600
+
+
+def test_token_refreshed_by_another_process_is_reused(tmp_path, monkeypatch):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=dict(access_token="mine", refresh_token="r3", expires_in=3600))
+
+    auth = make_auth(tmp_path, handler)
+    expired_token(auth)
+    real_lock = auth._refresh_lock
+
+    def lock_after_other_process_refreshed():
+        # Simulates a second process that refreshed while we waited for the lock.
+        write_token_file(
+            auth.token_file,
+            dict(access_token="theirs", refresh_token="r2", expires_in=3600, saved_at=time.time()),
+        )
+        return real_lock()
+
+    monkeypatch.setattr(auth, "_refresh_lock", lock_after_other_process_refreshed)
+    assert auth.get_access_token() == "theirs"
+    assert calls == []
+
+
+def test_refresh_creates_private_lock_file(tmp_path):
+    auth = make_auth(
+        tmp_path,
+        lambda request: httpx.Response(200, json=dict(access_token="n", refresh_token="r2", expires_in=3600)),
+    )
+    expired_token(auth)
+    auth.get_access_token()
+    assert auth.lock_file.exists()
+    assert stat.S_IMODE(auth.lock_file.stat().st_mode) == 0o600
