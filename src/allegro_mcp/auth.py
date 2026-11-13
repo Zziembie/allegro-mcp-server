@@ -16,6 +16,13 @@ from .user_agent import allegro_headers
 # Refresh the access token this many seconds before it expires.
 REFRESH_MARGIN_SECONDS = 300
 
+# A token file that does not parse is read again a few times before giving up:
+# on synced or network folders a reader can briefly see a half-written file.
+TOKEN_READ_ATTEMPTS = 3
+TOKEN_READ_RETRY_SECONDS = 0.5
+
+LOGIN_HINT = "Log in again with: allegro-mcp-server --auth"
+
 
 class AuthError(RuntimeError):
     """Raised when no usable token is available."""
@@ -38,6 +45,15 @@ def write_token_file(path: Path, token: dict[str, Any]) -> None:
         json.dump(token, f, indent=2)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
+
+
+def _oauth_error_code(resp: httpx.Response) -> str:
+    """The OAuth ``error`` field of a failed token response, or an empty string."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    return str(body.get("error") or "") if isinstance(body, dict) else ""
 
 
 class AllegroAuth:
@@ -64,10 +80,43 @@ class AllegroAuth:
         return f"{self.auth_base}/device"
 
     def load_token(self) -> dict[str, Any] | None:
-        try:
-            return json.loads(self.token_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
+        """Read the stored token. Returns None only when there is no token file.
+
+        A file that exists but cannot be read or parsed raises AuthError with the
+        reason, so that a permission or sync problem is not reported as "log in".
+        """
+        path = self.token_file
+        if path.is_symlink() and not path.exists():
+            raise AuthError(
+                f"The token file {path} is a symlink to a missing file "
+                f"({os.readlink(path)}). Fix the link or remove it. {LOGIN_HINT}"
+            )
+        problem = "empty file"
+        for attempt in range(TOKEN_READ_ATTEMPTS):
+            if attempt:
+                time.sleep(TOKEN_READ_RETRY_SECONDS)
+            try:
+                text = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise AuthError(
+                    f"Could not read the token file {path}: "
+                    f"{exc.strerror or exc} (errno {exc.errno}). "
+                    "The token was not changed; fix access to the file and try again."
+                ) from exc
+            try:
+                token = json.loads(text)
+            except ValueError as exc:
+                problem = str(exc)
+                continue
+            if isinstance(token, dict):
+                return token
+            problem = "not a JSON object"
+        raise AuthError(
+            f"The token file {path} is not valid JSON ({problem}). "
+            f"Delete it. {LOGIN_HINT}"
+        )
 
     def save_token(self, token: dict[str, Any]) -> None:
         token = {**token, "saved_at": time.time()}
@@ -82,19 +131,44 @@ class AllegroAuth:
         )
 
     def refresh(self, refresh_token: str) -> dict[str, Any]:
-        """Exchange a refresh token for a new token pair and store it."""
+        """Exchange a refresh token for a new token pair and store it.
+
+        Only a rejected refresh token asks the user to log in again. Network
+        errors and temporary server errors leave the stored token untouched.
+        """
+        unchanged = "The stored token is unchanged; try again later."
         try:
             resp = self._token_request(
                 {"grant_type": "refresh_token", "refresh_token": refresh_token}
             )
-        except httpx.HTTPError as exc:
-            raise AuthError(f"Could not refresh the Allegro token: {exc}") from exc
-        if resp.status_code != 200:
+        except httpx.TimeoutException as exc:
             raise AuthError(
-                f"Allegro rejected the refresh token (HTTP {resp.status_code}). "
-                "Log in again with: allegro-mcp-server --auth"
+                f"Allegro did not answer the token refresh in time. {unchanged}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise AuthError(
+                "Could not reach Allegro to refresh the token "
+                f"({type(exc).__name__}: {exc}). Check the network connection. {unchanged}"
+            ) from exc
+        status = resp.status_code
+        if status == 429 or status >= 500:
+            raise AuthError(
+                f"Allegro could not refresh the token right now (HTTP {status}). {unchanged}"
             )
-        token = resp.json()
+        if status != 200:
+            code = _oauth_error_code(resp)
+            detail = f", {code}" if code else ""
+            raise AuthError(
+                f"Allegro rejected the refresh token (HTTP {status}{detail}). {LOGIN_HINT}"
+            )
+        try:
+            token = resp.json()
+        except ValueError:
+            token = None
+        if not isinstance(token, dict) or not token.get("access_token"):
+            raise AuthError(
+                f"Allegro answered the token refresh without an access token. {unchanged}"
+            )
         self.save_token(token)
         return token
 
@@ -111,8 +185,7 @@ class AllegroAuth:
         refresh_token = token.get("refresh_token")
         if not refresh_token:
             raise AuthError(
-                "The Allegro token has expired and has no refresh token. "
-                "Log in again with: allegro-mcp-server --auth"
+                f"The Allegro token has expired and has no refresh token. {LOGIN_HINT}"
             )
         return self.refresh(refresh_token)["access_token"]
 

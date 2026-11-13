@@ -1,4 +1,5 @@
 import json
+import os
 import stat
 import time
 
@@ -75,3 +76,99 @@ def test_rejected_refresh_raises_auth_error(tmp_path):
     )
     with pytest.raises(AuthError, match="--auth"):
         auth.get_access_token()
+
+
+def expired_token(auth, **extra):
+    write_token_file(
+        auth.token_file,
+        dict(access_token="old", refresh_token="r1", expires_in=1, saved_at=0, **extra),
+    )
+
+
+def test_rejected_refresh_shows_allegro_error_code(tmp_path):
+    auth = make_auth(tmp_path, lambda request: httpx.Response(400, json={"error": "invalid_grant"}))
+    expired_token(auth)
+    with pytest.raises(AuthError, match="HTTP 400, invalid_grant"):
+        auth.get_access_token()
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_temporary_refresh_failure_does_not_ask_for_login(tmp_path, status):
+    auth = make_auth(tmp_path, lambda request: httpx.Response(status))
+    expired_token(auth)
+    with pytest.raises(AuthError) as excinfo:
+        auth.get_access_token()
+    assert f"HTTP {status}" in str(excinfo.value)
+    assert "--auth" not in str(excinfo.value)
+    assert auth.load_token()["refresh_token"] == "r1"
+
+
+def test_network_error_during_refresh_keeps_token(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    auth = make_auth(tmp_path, handler)
+    expired_token(auth)
+    with pytest.raises(AuthError, match="Could not reach Allegro") as excinfo:
+        auth.get_access_token()
+    assert "--auth" not in str(excinfo.value)
+    assert auth.load_token()["refresh_token"] == "r1"
+
+
+def test_refresh_timeout_has_its_own_message(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out")
+
+    auth = make_auth(tmp_path, handler)
+    expired_token(auth)
+    with pytest.raises(AuthError, match="did not answer"):
+        auth.get_access_token()
+
+
+def test_refresh_without_access_token_is_an_error(tmp_path):
+    auth = make_auth(tmp_path, lambda request: httpx.Response(200, json={"scope": "x"}))
+    expired_token(auth)
+    with pytest.raises(AuthError, match="without an access token"):
+        auth.get_access_token()
+    assert auth.load_token()["access_token"] == "old"
+
+
+def test_unreadable_token_file_is_not_reported_as_missing(tmp_path):
+    auth = make_auth(tmp_path)
+    auth.token_file.parent.mkdir(parents=True)
+    auth.token_file.mkdir()  # reading a directory raises OSError, as a locked file would
+    with pytest.raises(AuthError, match="Could not read the token file") as excinfo:
+        auth.get_access_token()
+    assert "errno" in str(excinfo.value)
+    assert "--auth" not in str(excinfo.value)
+
+
+def test_broken_symlink_is_named(tmp_path):
+    auth = make_auth(tmp_path)
+    auth.token_file.parent.mkdir(parents=True)
+    os.symlink(tmp_path / "gone.json", auth.token_file)
+    with pytest.raises(AuthError, match="symlink to a missing file"):
+        auth.get_access_token()
+
+
+def test_corrupt_token_file_is_retried_then_reported(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("allegro_mcp.auth.time.sleep", sleeps.append)
+    auth = make_auth(tmp_path)
+    auth.token_file.parent.mkdir(parents=True)
+    auth.token_file.write_text("{not json")
+    with pytest.raises(AuthError, match="not valid JSON"):
+        auth.get_access_token()
+    assert len(sleeps) == 2
+
+
+def test_token_file_that_recovers_is_read(tmp_path, monkeypatch):
+    auth = make_auth(tmp_path)
+    auth.token_file.parent.mkdir(parents=True)
+    auth.token_file.write_text("")
+
+    def finish_write(_seconds):
+        auth.save_token(dict(access_token="ready", expires_in=3600))
+
+    monkeypatch.setattr("allegro_mcp.auth.time.sleep", finish_write)
+    assert auth.get_access_token() == "ready"
